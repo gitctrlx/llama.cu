@@ -1,0 +1,9 @@
+[project]
+name = "llama"
+version = "0.1.0"
+description = "llama Numpy"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.3.4",
+]
