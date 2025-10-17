@@ -1,0 +1,48 @@
+# CUDA build artifacts (Windows/Linux)
+
+# Executables
+llama
+a.out
+
+# Object and dependency files
+*.o
+*.obj
+*.d
+*.dep
+
+# Static and shared libraries
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.lib
+*.exp
+
+# Debug / symbol files (MSVC, etc.)
+*.pdb
+*.ilk
+
+# NVCC intermediate/outputs
+*.ptx
+*.cubin
+*.fatbin
+*.sass
+*.cudafe*
+*.cu.cpp
+*.nvlinkinfo
+*.linkinfo
+
+# Build directories
+/build/
+/bin/
+/lib/
+/out/
+/Debug/
+/Release/
+/x64/
+/x86/
+
+# Logs and temporary files
+*.log
+*.tmp
