@@ -8,8 +8,6 @@ This repository demonstrates how to run LLaMA inference using CUDA C++, making i
 
 - **Pure CUDA Implementation** – Direct CUDA kernels for maximum performance without heavy ML frameworks
 - **Optimized Matrix Operations** – Custom CUDA kernels for matrix multiplication and attention mechanisms
-- **Memory Efficient** – Optimized memory access patterns for GPU cache efficiency
-- **Minimal Dependencies** – Standalone CUDA implementation without PyTorch or TensorFlow
 - **Educational** – Clean, readable CUDA code with inline documentation for learning GPU programming
 
 ## Usage
@@ -36,6 +34,11 @@ mkdir build && cd build
 cmake ..
 make
 ```
+
+## TODO
+
+- [ ] Implement FP16 (float16) version for better memory efficiency and performance
+- [ ] Add Flash Attention for faster attention computation
 
 ## Related Work
 
