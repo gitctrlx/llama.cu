@@ -1,626 +1,766 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <ctype.h>
-#include <time.h>
-#include <string.h>
+#include <cctype>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
 #include <fcntl.h>
-#include <unistd.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <vector>
 
-#include <cuda_runtime.h>
 #include <cub/cub.cuh>
 #include <cublas_v2.h>
+#include <cuda_runtime.h>
 
-#define CUDA_CHECK(val) { \
-    cudaError_t err = val; \
-    if (err != cudaSuccess) { \
-        fprintf(stderr, "CUDA Error %d: %s. In file '%s' on line %d\n", err, cudaGetErrorString(err), __FILE__, __LINE__); \
-        fflush(stderr); \
-        exit(err); \
-    } \
+#define CUDA_CHECK(expr)                                                       \
+  do {                                                                         \
+    cudaError_t err = (expr);                                                  \
+    if (err != cudaSuccess) {                                                  \
+      fprintf(stderr, "CUDA Error: %s at %s:%d\n", cudaGetErrorString(err),    \
+              __FILE__, __LINE__);                                             \
+      exit(EXIT_FAILURE);                                                      \
+    }                                                                          \
+  } while (0)
+
+#define CUBLAS_CHECK(expr)                                                     \
+  do {                                                                         \
+    cublasStatus_t stat = (expr);                                              \
+    if (stat != CUBLAS_STATUS_SUCCESS) {                                       \
+      fprintf(stderr, "cuBLAS Error: %d at %s:%d\n", stat, __FILE__,           \
+              __LINE__);                                                       \
+      exit(EXIT_FAILURE);                                                      \
+    }                                                                          \
+  } while (0)
+
+namespace llama {
+
+constexpr int kBlockSizeLarge = 1024;
+constexpr int kBlockSizeSmall = 128;
+
+// LlamaConfig aligns with LlamaConfig in Transformers.
+struct LlamaConfig {
+  int dim;         // hidden_size
+  int hidden_dim;  // intermediate_size
+  int n_layers;    // num_hidden_layers
+  int n_heads;     // num_attention_heads
+  int n_kv_heads;  // num_key_value_heads
+  int vocab_size;  // vocab_size
+  int max_seq_len; // max_position_embeddings
+};
+
+// LlamaLayerWeightsGPU holds device pointers for layer weights.
+struct LlamaLayerWeightsGPU {
+  float *attn_norm; // input_layernorm.weight
+  float *q_proj;    // self_attn.q_proj.weight
+  float *k_proj;    // self_attn.k_proj.weight
+  float *v_proj;    // self_attn.v_proj.weight
+  float *o_proj;    // self_attn.o_proj.weight
+  float *ffn_norm;  // post_attention_layernorm.weight
+  float *gate_proj; // mlp.gate_proj.weight
+  float *up_proj;   // mlp.up_proj.weight
+  float *down_proj; // mlp.down_proj.weight
+};
+
+// LlamaWeightsGPU holds all device weights.
+struct LlamaWeightsGPU {
+  float *embed_tokens;                      // model.embed_tokens.weight
+  float *norm;                              // model.norm.weight
+  float *output;                            // lm_head.weight
+  std::vector<LlamaLayerWeightsGPU> layers; // model.layers
+};
+
+// LlamaStateGPU holds device buffers for inference.
+struct LlamaStateGPU {
+  float *x;           // hidden_states
+  float *xb;          // temp for attention
+  float *xb2;         // temp for attention output
+  float *hb;          // mlp gate activation
+  float *hb2;         // mlp up activation
+  float *q;           // query
+  float *k;           // key (points into key_cache)
+  float *v;           // value (points into value_cache)
+  float *att;         // attention scores
+  float *logits_gpu;  // logits on GPU
+  float *logits_cpu;  // logits on CPU
+  float *key_cache;   // key cache
+  float *value_cache; // value cache
+};
+
+// CuBlasHandle RAII wrapper.
+class CuBlasHandle {
+public:
+  CuBlasHandle() { CUBLAS_CHECK(cublasCreate(&handle_)); }
+  ~CuBlasHandle() { CUBLAS_CHECK(cublasDestroy(handle_)); }
+  cublasHandle_t Get() const { return handle_; }
+
+private:
+  cublasHandle_t handle_;
+};
+
+// LlamaModelGPU manages the model on GPU.
+class LlamaModelGPU {
+public:
+  LlamaModelGPU(const char *checkpoint_path);
+  ~LlamaModelGPU();
+
+  void Forward(int token, int pos, float *logits_cpu);
+  const LlamaConfig &Config() const { return config_; }
+
+private:
+  void LoadWeights(const char *checkpoint_path);
+  void AllocState();
+  void FreeState();
+
+  void LayerForward(int layer, int pos);
+
+  LlamaConfig config_;
+  LlamaWeightsGPU weights_;
+  LlamaStateGPU state_;
+  CuBlasHandle cublas_;
+  int fd_ = -1;
+  void *mapped_data_ = MAP_FAILED;
+  size_t file_size_ = 0;
+  float *device_weights_ = nullptr;
+};
+
+LlamaModelGPU::LlamaModelGPU(const char *checkpoint_path) : cublas_() {
+  LoadWeights(checkpoint_path);
+  AllocState();
 }
 
-#define CUBLAS_CHECK(val) { \
-    cublasStatus_t stat = val; \
-    if (stat != CUBLAS_STATUS_SUCCESS) { \
-        fprintf(stderr, "cuBLAS Error %d. In file '%s' on line %d\n", stat, __FILE__, __LINE__); \
-        fflush(stderr); \
-        exit(stat); \
-    } \
+LlamaModelGPU::~LlamaModelGPU() {
+  FreeState();
+  if (device_weights_)
+    CUDA_CHECK(cudaFree(device_weights_));
+  if (mapped_data_ != MAP_FAILED)
+    munmap(mapped_data_, file_size_);
+  if (fd_ != -1)
+    close(fd_);
 }
 
-// Global cuBLAS handle
-cublasHandle_t g_cublas_handle;
+void LlamaModelGPU::LoadWeights(const char *checkpoint_path) {
+  FILE *file = fopen(checkpoint_path, "rb");
+  if (!file) {
+    fprintf(stderr, "Failed to open %s\n", checkpoint_path);
+    exit(EXIT_FAILURE);
+  }
+  if (fread(&config_, sizeof(LlamaConfig), 1, file) != 1) {
+    fprintf(stderr, "Failed to read config\n");
+    exit(EXIT_FAILURE);
+  }
+  int shared_weights = config_.vocab_size > 0 ? 1 : 0;
+  config_.vocab_size = std::abs(config_.vocab_size);
+  fseek(file, 0, SEEK_END);
+  file_size_ = ftell(file);
+  fclose(file);
 
-void create_cublas_handle() {
-    CUBLAS_CHECK(cublasCreate(&g_cublas_handle));
+  fd_ = open(checkpoint_path, O_RDONLY);
+  if (fd_ == -1) {
+    fprintf(stderr, "open failed: %s\n", checkpoint_path);
+    exit(EXIT_FAILURE);
+  }
+  mapped_data_ = mmap(nullptr, file_size_, PROT_READ, MAP_PRIVATE, fd_, 0);
+  if (mapped_data_ == MAP_FAILED) {
+    fprintf(stderr, "mmap failed\n");
+    exit(EXIT_FAILURE);
+  }
+
+  size_t weights_size = file_size_ - sizeof(LlamaConfig);
+  CUDA_CHECK(cudaMalloc(&device_weights_, weights_size));
+  CUDA_CHECK(cudaMemcpy(device_weights_,
+                        static_cast<char *>(mapped_data_) + sizeof(LlamaConfig),
+                        weights_size, cudaMemcpyHostToDevice));
+
+  float *ptr = device_weights_;
+  weights_.embed_tokens = ptr;
+  ptr += config_.vocab_size * config_.dim;
+  weights_.layers.resize(config_.n_layers);
+
+  // All attn_norm (rms_att_weight)
+  for (int l = 0; l < config_.n_layers; ++l) {
+    weights_.layers[l].attn_norm = ptr;
+    ptr += config_.dim;
+  }
+
+  int head_size = config_.dim / config_.n_heads;
+
+  // All q_proj (wq)
+  for (int l = 0; l < config_.n_layers; ++l) {
+    weights_.layers[l].q_proj = ptr;
+    ptr += config_.dim * (config_.n_heads * head_size);
+  }
+
+  // All k_proj (wk)
+  for (int l = 0; l < config_.n_layers; ++l) {
+    weights_.layers[l].k_proj = ptr;
+    ptr += config_.dim * (config_.n_kv_heads * head_size);
+  }
+
+  // All v_proj (wv)
+  for (int l = 0; l < config_.n_layers; ++l) {
+    weights_.layers[l].v_proj = ptr;
+    ptr += config_.dim * (config_.n_kv_heads * head_size);
+  }
+
+  // All o_proj (wo)
+  for (int l = 0; l < config_.n_layers; ++l) {
+    weights_.layers[l].o_proj = ptr;
+    ptr += (config_.n_heads * head_size) * config_.dim;
+  }
+
+  // All ffn_norm (rms_ffn_weight)
+  for (int l = 0; l < config_.n_layers; ++l) {
+    weights_.layers[l].ffn_norm = ptr;
+    ptr += config_.dim;
+  }
+
+  // All gate_proj (w1 / gate_proj)
+  for (int l = 0; l < config_.n_layers; ++l) {
+    weights_.layers[l].gate_proj = ptr;
+    ptr += config_.dim * config_.hidden_dim;
+  }
+
+  // All down_proj (w2 / down_proj)
+  for (int l = 0; l < config_.n_layers; ++l) {
+    weights_.layers[l].down_proj = ptr;
+    ptr += config_.hidden_dim * config_.dim;
+  }
+
+  // All up_proj (w3 / up_proj)
+  for (int l = 0; l < config_.n_layers; ++l) {
+    weights_.layers[l].up_proj = ptr;
+    ptr += config_.dim * config_.hidden_dim;
+  }
+
+  weights_.norm = ptr;
+  ptr += config_.dim;
+  ptr += config_.max_seq_len * head_size / 2; // skip freq_cis_real
+  ptr += config_.max_seq_len * head_size / 2; // skip freq_cis_imag
+  weights_.output = shared_weights ? weights_.embed_tokens : ptr;
 }
 
-void destroy_cublas_handle() {
-    CUBLAS_CHECK(cublasDestroy(g_cublas_handle));
+void LlamaModelGPU::AllocState() {
+  int kv_dim = (config_.dim * config_.n_kv_heads) / config_.n_heads;
+  CUDA_CHECK(cudaMalloc(&state_.x, config_.dim * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&state_.xb, config_.dim * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&state_.xb2, config_.dim * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&state_.hb, config_.hidden_dim * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&state_.hb2, config_.hidden_dim * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&state_.q, config_.dim * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&state_.key_cache,
+                        static_cast<size_t>(config_.n_layers) *
+                            config_.max_seq_len * kv_dim * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&state_.value_cache,
+                        static_cast<size_t>(config_.n_layers) *
+                            config_.max_seq_len * kv_dim * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&state_.att,
+                        config_.n_heads * config_.max_seq_len * sizeof(float)));
+  CUDA_CHECK(
+      cudaMalloc(&state_.logits_gpu, config_.vocab_size * sizeof(float)));
+  state_.logits_cpu = new float[config_.vocab_size]();
 }
 
-// Transformer config
-typedef struct {
-    int dim;
-    int hidden_dim;
-    int n_layers;
-    int n_heads;
-    int n_kv_heads;
-    int vocab_size;
-    int max_seq_len;
-} Config;
+void LlamaModelGPU::FreeState() {
+  CUDA_CHECK(cudaFree(state_.x));
+  CUDA_CHECK(cudaFree(state_.xb));
+  CUDA_CHECK(cudaFree(state_.xb2));
+  CUDA_CHECK(cudaFree(state_.hb));
+  CUDA_CHECK(cudaFree(state_.hb2));
+  CUDA_CHECK(cudaFree(state_.q));
+  CUDA_CHECK(cudaFree(state_.key_cache));
+  CUDA_CHECK(cudaFree(state_.value_cache));
+  CUDA_CHECK(cudaFree(state_.att));
+  CUDA_CHECK(cudaFree(state_.logits_gpu));
+  delete[] state_.logits_cpu;
+}
 
-// Weights on GPU
-typedef struct {
-    float* token_embedding;
-    float* rms_att_weight;
-    float* wq;
-    float* wk;
-    float* wv;
-    float* wo;
-    float* rms_ffn_weight;
-    float* w1;
-    float* w2;
-    float* w3;
-    float* rms_final_weight;
-    float* wcls;
-} TransformerWeights;
+// Kernels and helpers
 
-// Run state on GPU (except cpu logits)
-typedef struct {
-    float* x;
-    float* xb;
-    float* xb2;
-    float* hb;
-    float* hb2;
-    float* q;
-    float* k;
-    float* v;
-    float* att;
-    float* logits_gpu;
-    float* logits; // CPU
-    float* key_cache;
-    float* value_cache;
-} RunState;
+__global__ void RmsNormKernel(float *o, const float *x, const float *weight,
+                              int size) {
+  int tid = threadIdx.x;
+  __shared__ float shared_ss;
+  float ss = 0.0f;
+  for (int j = tid; j < size; j += blockDim.x) {
+    ss += x[j] * x[j];
+  }
+  typedef cub::BlockReduce<float, kBlockSizeLarge> BlockReduce;
+  __shared__ typename BlockReduce::TempStorage temp;
+  ss = BlockReduce(temp).Sum(ss);
+  if (tid == 0) {
+    ss /= size;
+    ss += 1e-5f;
+    shared_ss = rsqrtf(ss);
+  }
+  __syncthreads();
+  for (int j = tid; j < size; j += blockDim.x) {
+    o[j] = weight[j] * (shared_ss * x[j]);
+  }
+}
 
-// Transformer
-typedef struct {
-    Config config;
-    TransformerWeights weights;
-    RunState state;
-    int fd;
-    float* data;
-    ssize_t file_size;
-} Transformer;
+void RmsNorm(float *o, const float *x, const float *weight, int size) {
+  RmsNormKernel<<<1, kBlockSizeLarge>>>(o, x, weight, size);
+  CUDA_CHECK(cudaGetLastError());
+}
 
-void malloc_run_state(RunState* s, const Config* p) {
-    int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
-    CUDA_CHECK(cudaMalloc(&s->x, p->dim * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&s->xb, p->dim * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&s->xb2, p->dim * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&s->hb, p->hidden_dim * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&s->hb2, p->hidden_dim * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&s->q, p->dim * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&s->key_cache, (size_t)p->n_layers * p->max_seq_len * kv_dim * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&s->value_cache, (size_t)p->n_layers * p->max_seq_len * kv_dim * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&s->att, p->n_heads * p->max_seq_len * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&s->logits_gpu, p->vocab_size * sizeof(float)));
-    s->logits = (float*)calloc(p->vocab_size, sizeof(float));
-    if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q || !s->key_cache || !s->value_cache || !s->att || !s->logits_gpu || !s->logits) {
-        fprintf(stderr, "cudaMalloc failed!\n");
-        exit(EXIT_FAILURE);
+void Matmul(float *xout, const float *x, const float *w, int n, int d,
+            cublasHandle_t handle) {
+  float alpha = 1.0f, beta = 0.0f;
+  CUBLAS_CHECK(cublasSgemv(handle, CUBLAS_OP_T, n, d, &alpha, w, n, x, 1, &beta,
+                           xout, 1));
+}
+
+__global__ void ApplyRotaryEmbKernel(int pos, float *q, float *k, int dim,
+                                     int kv_dim, int head_size) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= dim / 2)
+    return;
+  i *= 2;
+  float freq = 1.0f / powf(10000.0f, float(i % head_size) / float(head_size));
+  float val = float(pos) * freq;
+  float fcr = cosf(val), fci = sinf(val);
+  int rotn = (i < kv_dim) ? 2 : 1;
+  for (int v = 0; v < rotn; ++v) {
+    float *vec = (v == 0) ? q : k;
+    float v0 = vec[i], v1 = vec[i + 1];
+    vec[i] = v0 * fcr - v1 * fci;
+    vec[i + 1] = v0 * fci + v1 * fcr;
+  }
+}
+
+void ApplyRotaryEmb(int pos, float *q, float *k, int dim, int kv_dim,
+                    int head_size) {
+  int blocks = (dim / 2 + kBlockSizeSmall - 1) / kBlockSizeSmall;
+  ApplyRotaryEmbKernel<<<blocks, kBlockSizeSmall>>>(pos, q, k, dim, kv_dim,
+                                                    head_size);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+__device__ void SoftmaxDevice(float *x, int size) {
+  int tid = threadIdx.x, step = blockDim.x;
+  float max_val = (tid < size) ? x[tid] : -INFINITY;
+  for (int i = tid + step; i < size; i += step) {
+    max_val = fmaxf(max_val, x[i]);
+  }
+  typedef cub::BlockReduce<float, kBlockSizeLarge> BlockReduce;
+  __shared__ typename BlockReduce::TempStorage temp;
+  max_val = BlockReduce(temp).Reduce(max_val, cuda::maximum{});
+  __shared__ float shared_max;
+  if (tid == 0)
+    shared_max = max_val;
+  __syncthreads();
+  float sum = 0.0f;
+  for (int i = tid; i < size; i += step) {
+    x[i] = expf(x[i] - shared_max);
+    sum += x[i];
+  }
+  sum = BlockReduce(temp).Sum(sum);
+  __shared__ float shared_sum;
+  if (tid == 0)
+    shared_sum = sum;
+  __syncthreads();
+  for (int i = tid; i < size; i += step) {
+    x[i] /= shared_sum;
+  }
+}
+
+__global__ void MultiHeadAttnKernel(int pos, int seq_len, const float *q,
+                                    float *att, float *xb,
+                                    const float *key_cache,
+                                    const float *value_cache, int kv_dim,
+                                    int kv_mul, int head_size, int loff) {
+  int h = blockIdx.x;
+  const float *query = q + h * head_size;
+  float *attn_scores = att + h * seq_len;
+  int tid = threadIdx.x, step = blockDim.x;
+  for (int t = tid; t <= pos; t += step) {
+    const float *key = key_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
+    float score = 0.0f;
+    for (int i = 0; i < head_size; ++i) {
+      score += query[i] * key[i];
     }
-    s->k = NULL; // Set in forward
-    s->v = NULL;
-}
-
-void free_run_state(RunState* s) {
-    CUDA_CHECK(cudaFree(s->x));
-    CUDA_CHECK(cudaFree(s->xb));
-    CUDA_CHECK(cudaFree(s->xb2));
-    CUDA_CHECK(cudaFree(s->hb));
-    CUDA_CHECK(cudaFree(s->hb2));
-    CUDA_CHECK(cudaFree(s->q));
-    CUDA_CHECK(cudaFree(s->att));
-    CUDA_CHECK(cudaFree(s->logits_gpu));
-    free(s->logits);
-    CUDA_CHECK(cudaFree(s->key_cache));
-    CUDA_CHECK(cudaFree(s->value_cache));
-}
-
-void memory_map_weights(TransformerWeights* w, const Config* p, float* ptr, int shared_weights) {
-    int head_size = p->dim / p->n_heads;
-    unsigned long long n_layers = p->n_layers;
-    w->token_embedding = ptr;
-    ptr += (size_t)p->vocab_size * p->dim;
-    w->rms_att_weight = ptr;
-    ptr += n_layers * p->dim;
-    w->wq = ptr;
-    ptr += n_layers * p->dim * (p->n_heads * head_size);
-    w->wk = ptr;
-    ptr += n_layers * p->dim * (p->n_kv_heads * head_size);
-    w->wv = ptr;
-    ptr += n_layers * p->dim * (p->n_kv_heads * head_size);
-    w->wo = ptr;
-    ptr += n_layers * (p->n_heads * head_size) * p->dim;
-    w->rms_ffn_weight = ptr;
-    ptr += n_layers * p->dim;
-    w->w1 = ptr;
-    ptr += n_layers * p->dim * p->hidden_dim;
-    w->w2 = ptr;
-    ptr += n_layers * p->hidden_dim * p->dim;
-    w->w3 = ptr;
-    ptr += n_layers * p->dim * p->hidden_dim;
-    w->rms_final_weight = ptr;
-    ptr += p->dim;
-    ptr += p->max_seq_len * head_size / 2; // skip freq_cis_real
-    ptr += p->max_seq_len * head_size / 2; // skip freq_cis_imag
-    w->wcls = shared_weights ? w->token_embedding : ptr;
-}
-
-void read_checkpoint(const char* checkpoint, Config* config, TransformerWeights* weights,
-                     int* fd, float** data, ssize_t* file_size) {
-    FILE* file = fopen(checkpoint, "rb");
-    if (!file) {
-        fprintf(stderr, "Couldn't open file %s\n", checkpoint);
-        exit(EXIT_FAILURE);
+    attn_scores[t] = score / sqrtf(float(head_size));
+  }
+  __syncthreads();
+  SoftmaxDevice(attn_scores, pos + 1);
+  __syncthreads();
+  float *out_head = xb + h * head_size;
+  for (int i = tid; i < head_size; i += step) {
+    float val = 0.0f;
+    for (int t = 0; t <= pos; ++t) {
+      const float *value =
+          value_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
+      val += attn_scores[t] * value[i];
     }
-    if (fread(config, sizeof(Config), 1, file) != 1) exit(EXIT_FAILURE);
-    int shared_weights = config->vocab_size > 0 ? 1 : 0;
-    config->vocab_size = abs(config->vocab_size);
-    fseek(file, 0, SEEK_END);
-    *file_size = ftell(file);
-    fclose(file);
-    *fd = open(checkpoint, O_RDONLY);
-    if (*fd == -1) {
-        fprintf(stderr, "open failed!\n");
-        exit(EXIT_FAILURE);
+    out_head[i] = val;
+  }
+}
+
+void MultiHeadAttn(int pos, int n_heads, int max_seq_len, const float *q,
+                   float *att, float *xb, const float *key_cache,
+                   const float *value_cache, int kv_dim, int kv_mul,
+                   int head_size, int loff) {
+  int block_dim = kBlockSizeLarge;
+  MultiHeadAttnKernel<<<n_heads, block_dim>>>(pos, max_seq_len, q, att, xb,
+                                              key_cache, value_cache, kv_dim,
+                                              kv_mul, head_size, loff);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+__global__ void SwiGLUKernel(float *hb, const float *hb2, int size) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < size) {
+    float val = hb[i];
+    val *= 1.0f / (1.0f + expf(-val));
+    hb[i] = val * hb2[i];
+  }
+}
+
+void SwiGLU(float *hb, const float *hb2, int hidden_dim) {
+  int blocks = (hidden_dim + kBlockSizeSmall - 1) / kBlockSizeSmall;
+  SwiGLUKernel<<<blocks, kBlockSizeSmall>>>(hb, hb2, hidden_dim);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+__global__ void AccumKernel(float *a, const float *b, int size) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < size)
+    a[i] += b[i];
+}
+
+void Accum(float *a, const float *b, int size) {
+  int blocks = (size + kBlockSizeSmall - 1) / kBlockSizeSmall;
+  AccumKernel<<<blocks, kBlockSizeSmall>>>(a, b, size);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void LlamaModelGPU::LayerForward(int layer, int pos) {
+  auto &lw = weights_.layers[layer];
+  int dim = config_.dim;
+  int kv_dim = (config_.dim * config_.n_kv_heads) / config_.n_heads;
+  int kv_mul = config_.n_heads / config_.n_kv_heads;
+  int head_size = config_.dim / config_.n_heads;
+  int loff = layer * config_.max_seq_len * kv_dim;
+
+  RmsNorm(state_.xb, state_.x, lw.attn_norm, dim);
+
+  Matmul(state_.q, state_.xb, lw.q_proj, dim, dim, cublas_.Get());
+  state_.k = state_.key_cache + loff + pos * kv_dim;
+  Matmul(state_.k, state_.xb, lw.k_proj, dim, kv_dim, cublas_.Get());
+  state_.v = state_.value_cache + loff + pos * kv_dim;
+  Matmul(state_.v, state_.xb, lw.v_proj, dim, kv_dim, cublas_.Get());
+
+  ApplyRotaryEmb(pos, state_.q, state_.k, dim, kv_dim, head_size);
+
+  MultiHeadAttn(pos, config_.n_heads, config_.max_seq_len, state_.q, state_.att,
+                state_.xb, state_.key_cache, state_.value_cache, kv_dim, kv_mul,
+                head_size, loff);
+
+  Matmul(state_.xb2, state_.xb, lw.o_proj, dim, dim, cublas_.Get());
+
+  Accum(state_.x, state_.xb2, dim);
+
+  RmsNorm(state_.xb, state_.x, lw.ffn_norm, dim);
+
+  Matmul(state_.hb, state_.xb, lw.gate_proj, dim, config_.hidden_dim,
+         cublas_.Get());
+  Matmul(state_.hb2, state_.xb, lw.up_proj, dim, config_.hidden_dim,
+         cublas_.Get());
+
+  SwiGLU(state_.hb, state_.hb2, config_.hidden_dim);
+
+  Matmul(state_.xb, state_.hb, lw.down_proj, config_.hidden_dim, dim,
+         cublas_.Get());
+
+  Accum(state_.x, state_.xb, dim);
+}
+
+void LlamaModelGPU::Forward(int token, int pos, float *logits_cpu) {
+  int dim = config_.dim;
+  float *embed_row = weights_.embed_tokens + token * dim;
+  CUDA_CHECK(cudaMemcpy(state_.x, embed_row, dim * sizeof(float),
+                        cudaMemcpyDeviceToDevice));
+
+  for (int l = 0; l < config_.n_layers; ++l) {
+    LayerForward(l, pos);
+  }
+
+  RmsNorm(state_.x, state_.x, weights_.norm, dim);
+
+  Matmul(state_.logits_gpu, state_.x, weights_.output, dim, config_.vocab_size,
+         cublas_.Get());
+
+  CUDA_CHECK(cudaMemcpy(logits_cpu, state_.logits_gpu,
+                        config_.vocab_size * sizeof(float),
+                        cudaMemcpyDeviceToHost));
+}
+
+// Tokenizer (BPE)
+
+struct TokenIndex {
+  char *str;
+  int id;
+};
+
+static int TokenCompareVoid(const void *a, const void *b) {
+  return strcmp(static_cast<const TokenIndex *>(a)->str,
+                static_cast<const TokenIndex *>(b)->str);
+}
+
+bool TokenCompare(const TokenIndex &a, const TokenIndex &b) {
+  return strcmp(a.str, b.str) < 0;
+}
+
+class Tokenizer {
+public:
+  Tokenizer(const char *path, int vocab_size);
+  ~Tokenizer();
+
+  void Encode(const char *text, bool bos, bool eos, int *tokens, int *n_tokens);
+  char *Decode(int prev_token, int token);
+  int StrLookup(char *str);
+
+private:
+  char **vocab_ = nullptr;
+  float *vocab_scores_ = nullptr;
+  TokenIndex *sorted_vocab_ = nullptr;
+  int vocab_size_ = 0;
+  unsigned int max_token_length_ = 0;
+  unsigned char byte_pieces_[512] = {0}; // <0xNN> tokens
+};
+
+Tokenizer::Tokenizer(const char *path, int vocab_size)
+    : vocab_size_(vocab_size) {
+  vocab_ = new char *[vocab_size];
+  vocab_scores_ = new float[vocab_size];
+  for (int i = 0; i < 256; ++i) {
+    byte_pieces_[i * 2] = static_cast<unsigned char>(i);
+    byte_pieces_[i * 2 + 1] = '\0';
+  }
+  FILE *file = fopen(path, "rb");
+  if (!file) {
+    fprintf(stderr, "Failed to load tokenizer: %s\n", path);
+    exit(EXIT_FAILURE);
+  }
+  if (fread(&max_token_length_, sizeof(unsigned int), 1, file) != 1) {
+    fprintf(stderr, "Failed to read max_token_length\n");
+    exit(EXIT_FAILURE);
+  }
+  for (int i = 0; i < vocab_size; ++i) {
+    if (fread(vocab_scores_ + i, sizeof(float), 1, file) != 1) {
+      fprintf(stderr, "Failed to read vocab score\n");
+      exit(EXIT_FAILURE);
     }
-    *data = (float*)mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, *fd, 0);
-    if (*data == MAP_FAILED) {
-        fprintf(stderr, "mmap failed!\n");
-        exit(EXIT_FAILURE);
-    }
-    float* weights_ptr;
-    size_t weights_size = *file_size - sizeof(Config);
-    CUDA_CHECK(cudaMalloc(&weights_ptr, weights_size));
-    CUDA_CHECK(cudaMemcpy(weights_ptr, *data + sizeof(Config)/sizeof(float), weights_size, cudaMemcpyHostToDevice));
-    memory_map_weights(weights, config, weights_ptr, shared_weights);
-}
-
-void build_transformer(Transformer* t, const char* checkpoint_path) {
-    read_checkpoint(checkpoint_path, &t->config, &t->weights, &t->fd, &t->data, &t->file_size);
-    malloc_run_state(&t->state, &t->config);
-}
-
-void free_transformer(Transformer* t) {
-    if (t->data != MAP_FAILED) munmap(t->data, t->file_size);
-    if (t->fd != -1) close(t->fd);
-    CUDA_CHECK(cudaFree(t->weights.token_embedding));
-    free_run_state(&t->state);
-}
-
-// Neural net blocks
-
-int divUp(int a, int b) { return (a - 1) / b + 1; }
-
-const int BLOCK_SIZE_LARGE = 256;
-const int BLOCK_SIZE_SMALL = 128;
-
-__global__ void rmsnorm_kernel(float* o, const float* x, const float* weight, int size) {
-    int tid = threadIdx.x;
-    typedef cub::BlockReduce<float, BLOCK_SIZE_LARGE> BlockReduce;
-    __shared__ typename BlockReduce::TempStorage temp;
-    __shared__ float shared_ss;
-    float ss = 0.0f;
-    for (int j = tid; j < size; j += blockDim.x) {
-        ss += x[j] * x[j];
-    }
-    ss = BlockReduce(temp).Sum(ss);
-    if (tid == 0) {
-        ss /= size;
-        ss += 1e-5f;
-        shared_ss = 1.0f / sqrtf(ss);
-    }
-    __syncthreads();
-    ss = shared_ss;
-    for (int j = tid; j < size; j += blockDim.x) {
-        o[j] = weight[j] * (ss * x[j]);
-    }
-}
-
-void rmsnorm(float* o, const float* x, const float* weight, int size) {
-    rmsnorm_kernel<<<1, BLOCK_SIZE_LARGE, sizeof(float)>>>(o, x, weight, size);
-    CUDA_CHECK(cudaGetLastError());
-}
-
-__device__ void softmax_gpu(float* x, int size) {
-    int tid = threadIdx.x;
-    int step = blockDim.x;
-    typedef cub::BlockReduce<float, BLOCK_SIZE_LARGE> BlockReduce;
-    __shared__ typename BlockReduce::TempStorage temp;
-    __shared__ float shared_val;
-    float max_val = (tid < size) ? x[tid] : -INFINITY;
-    for (int i = tid + step; i < size; i += step) {
-        max_val = max(max_val, x[i]);
-    }
-    max_val = BlockReduce(temp).Reduce(max_val, cuda::maximum{});
-    if (tid == 0) shared_val = max_val;
-    __syncthreads();
-    max_val = shared_val;
-    float sum = 0.0f;
-    for (int i = tid; i < size; i += step) {
-        x[i] = expf(x[i] - max_val);
-        sum += x[i];
-    }
-    sum = BlockReduce(temp).Sum(sum);
-    if (tid == 0) shared_val = sum;
-    __syncthreads();
-    sum = shared_val;
-    for (int i = tid; i < size; i += step) {
-        x[i] /= sum;
-    }
-}
-
-// Matmul using cuBLAS (gemv)
-void matmul(float* xout, const float* x, const float* w, int n, int d) {
-    float alpha = 1.0f, beta = 0.0f;
-    CUBLAS_CHECK(cublasSgemv(g_cublas_handle, CUBLAS_OP_T, n, d, &alpha, w, n, x, 1, &beta, xout, 1));
-}
-
-__global__ void rope_rotation_kernel(int pos, float* sq, float* sk, int kv_dim, int head_size) {
-    int i = threadIdx.x * 2;
-    if (i >= head_size) return;
-    float freq = 1.0f / powf(10000.0f, (float)(i % head_size) / head_size);
-    float val = pos * freq;
-    float fcr = cosf(val);
-    float fci = sinf(val);
-    int rotn = (i < kv_dim) ? 2 : 1;
-    for (int v = 0; v < rotn; v++) {
-        float* vec = (v == 0) ? sq : sk;
-        float v0 = vec[i];
-        float v1 = vec[i + 1];
-        vec[i] = v0 * fcr - v1 * fci;
-        vec[i + 1] = v0 * fci + v1 * fcr;
-    }
-}
-
-void rope_rotation(int pos, const RunState* s, int dim, int kv_dim, int head_size) {
-    rope_rotation_kernel<<<1, (dim + 1) / 2>>>(pos, s->q, s->k, kv_dim, head_size);
-    CUDA_CHECK(cudaGetLastError());
-}
-
-__global__ void multihead_attn_kernel(int pos, int seq_len, const float* sq, float* satt, float* sxb, const float* key_cache,
-                                      const float* value_cache, int kv_dim, int kv_mul, int head_size, int loff) {
-    int h = blockIdx.x;
-    const float* q = sq + h * head_size;
-    float* att = satt + h * seq_len;
-    int tid = threadIdx.x;
-    int step = blockDim.x;
-    for (int t = tid; t <= pos; t += step) {
-        const float* k = key_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
-        float score = 0.0f;
-        for (int i = 0; i < head_size; i++) {
-            score += q[i] * k[i];
-        }
-        att[t] = score / sqrtf((float)head_size);
-    }
-    __syncthreads();
-    softmax_gpu(att, pos + 1);
-    __syncthreads();
-    float* xb = sxb + h * head_size;
-    for (int i = tid; i < head_size; i += step) {
-        float val = 0.0f;
-        for (int t = 0; t <= pos; t++) {
-            const float* v = value_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
-            val += att[t] * v[i];
-        }
-        xb[i] = val;
-    }
-}
-
-void multihead_attention(int pos, const Config* p, const RunState* s, int kv_dim, int kv_mul, int head_size, int loff) {
-    int block_dim = 128;
-    if (pos + 1 > 128) block_dim = 256;
-    multihead_attn_kernel<<<p->n_heads, block_dim>>>(pos, p->max_seq_len, s->q, s->att, s->xb, s->key_cache, s->value_cache, kv_dim, kv_mul, head_size, loff);
-    CUDA_CHECK(cudaGetLastError());
-}
-
-__global__ void silu_mul_kernel(float* hb, const float* hb2, int size) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < size) {
-        float val = hb[i];
-        val *= 1.0f / (1.0f + expf(-val));
-        hb[i] = val * hb2[i];
-    }
-}
-
-void silu_mul(RunState* s, int hidden_dim) {
-    silu_mul_kernel<<<divUp(hidden_dim, BLOCK_SIZE_SMALL), BLOCK_SIZE_SMALL>>>(s->hb, s->hb2, hidden_dim);
-    CUDA_CHECK(cudaGetLastError());
-}
-
-__global__ void accum_kernel(float* a, const float* b, int size) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < size) a[i] += b[i];
-}
-
-void accum(float* a, const float* b, int size) {
-    accum_kernel<<<divUp(size, BLOCK_SIZE_SMALL), BLOCK_SIZE_SMALL>>>(a, b, size);
-    CUDA_CHECK(cudaGetLastError());
-}
-
-float* forward(Transformer* transformer, int token, int pos) {
-    const Config* p = &transformer->config;
-    const TransformerWeights* w = &transformer->weights;
-    RunState* s = &transformer->state;
-    float* x = s->x;
-    int dim = p->dim;
-    int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
-    int kv_mul = p->n_heads / p->n_kv_heads;
-    int hidden_dim = p->hidden_dim;
-    int head_size = dim / p->n_heads;
-
-    float* content_row = w->token_embedding + (size_t)token * dim;
-    CUDA_CHECK(cudaMemcpy(x, content_row, dim * sizeof(float), cudaMemcpyDeviceToDevice));
-
-    for (int l = 0; l < p->n_layers; l++) {
-        rmsnorm(s->xb, x, w->rms_att_weight + (size_t)l * dim, dim);
-
-        int loff = l * p->max_seq_len * kv_dim;
-        s->k = s->key_cache + loff + pos * kv_dim;
-        s->v = s->value_cache + loff + pos * kv_dim;
-
-        matmul(s->q, s->xb, w->wq + (size_t)l * dim * dim, dim, dim);
-        matmul(s->k, s->xb, w->wk + (size_t)l * dim * kv_dim, dim, kv_dim);
-        matmul(s->v, s->xb, w->wv + (size_t)l * dim * kv_dim, dim, kv_dim);
-
-        rope_rotation(pos, s, dim, kv_dim, head_size);
-
-        multihead_attention(pos, p, s, kv_dim, kv_mul, head_size, loff);
-
-        matmul(s->xb2, s->xb, w->wo + (size_t)l * dim * dim, dim, dim);
-
-        accum(x, s->xb2, dim);
-
-        rmsnorm(s->xb, x, w->rms_ffn_weight + (size_t)l * dim, dim);
-
-        matmul(s->hb, s->xb, w->w1 + (size_t)l * dim * hidden_dim, dim, hidden_dim);
-        matmul(s->hb2, s->xb, w->w3 + (size_t)l * dim * hidden_dim, dim, hidden_dim);
-
-        silu_mul(s, hidden_dim);
-
-        matmul(s->xb, s->hb, w->w2 + (size_t)l * hidden_dim * dim, hidden_dim, dim);
-
-        accum(x, s->xb, dim);
-    }
-
-    rmsnorm(x, x, w->rms_final_weight, dim);
-
-    matmul(s->logits_gpu, x, w->wcls, dim, p->vocab_size);
-
-    CUDA_CHECK(cudaMemcpy(s->logits, s->logits_gpu, p->vocab_size * sizeof(float), cudaMemcpyDeviceToHost));
-
-    return s->logits;
-}
-
-// Tokenizer (kept similar, minor cleans)
-
-typedef struct {
-    char* str;
-    int id;
-} TokenIndex;
-
-typedef struct {
-    char** vocab;
-    float* vocab_scores;
-    TokenIndex* sorted_vocab;
-    int vocab_size;
-    unsigned int max_token_length;
-    unsigned char byte_pieces[512];
-} Tokenizer;
-
-int compare_tokens(const void* a, const void* b) {
-    return strcmp(((const TokenIndex*)a)->str, ((const TokenIndex*)b)->str);
-}
-
-void build_tokenizer(Tokenizer* t, const char* tokenizer_path, int vocab_size) {
-    t->vocab_size = vocab_size;
-    t->vocab = (char**)malloc((size_t)vocab_size * sizeof(char*));
-    t->vocab_scores = (float*)malloc((size_t)vocab_size * sizeof(float));
-    t->sorted_vocab = NULL;
-    for (int i = 0; i < 256; i++) {
-        t->byte_pieces[i * 2] = (unsigned char)i;
-        t->byte_pieces[i * 2 + 1] = '\0';
-    }
-    FILE* file = fopen(tokenizer_path, "rb");
-    if (!file) {
-        fprintf(stderr, "couldn't load %s\n", tokenizer_path);
-        exit(EXIT_FAILURE);
-    }
-    if (fread(&t->max_token_length, sizeof(int), 1, file) != 1) exit(EXIT_FAILURE);
     int len;
-    for (int i = 0; i < vocab_size; i++) {
-        if (fread(t->vocab_scores + i, sizeof(float), 1, file) != 1) exit(EXIT_FAILURE);
-        if (fread(&len, sizeof(int), 1, file) != 1) exit(EXIT_FAILURE);
-        t->vocab[i] = (char*)malloc((size_t)len + 1);
-        if (fread(t->vocab[i], (size_t)len, 1, file) != 1) exit(EXIT_FAILURE);
-        t->vocab[i][len] = '\0';
+    if (fread(&len, sizeof(int), 1, file) != 1) {
+      fprintf(stderr, "Failed to read token length\n");
+      exit(EXIT_FAILURE);
     }
-    fclose(file);
+    vocab_[i] = new char[len + 1];
+    if (fread(vocab_[i], len, 1, file) != 1) {
+      fprintf(stderr, "Failed to read token\n");
+      exit(EXIT_FAILURE);
+    }
+    vocab_[i][len] = '\0';
+  }
+  fclose(file);
 }
 
-void free_tokenizer(Tokenizer* t) {
-    for (int i = 0; i < t->vocab_size; i++) free(t->vocab[i]);
-    free(t->vocab);
-    free(t->vocab_scores);
-    free(t->sorted_vocab);
+Tokenizer::~Tokenizer() {
+  for (int i = 0; i < vocab_size_; ++i) {
+    delete[] vocab_[i];
+  }
+  delete[] vocab_;
+  delete[] vocab_scores_;
+  delete[] sorted_vocab_;
 }
 
-char* decode(Tokenizer* t, int prev_token, int token) {
-    char* piece = t->vocab[token];
-    if (prev_token == 1 && piece[0] == ' ') piece++;
-    unsigned char byte_val;
-    if (sscanf(piece, "<0x%02hhX>", &byte_val) == 1) {
-        piece = (char*)t->byte_pieces + byte_val * 2;
-    }
-    return piece;
+int Tokenizer::StrLookup(char *str) {
+  TokenIndex key = {.str = str};
+  TokenIndex *res = static_cast<TokenIndex *>(std::bsearch(
+      &key, sorted_vocab_, vocab_size_, sizeof(TokenIndex), TokenCompareVoid));
+  return res ? res->id : -1;
 }
 
-void safe_printf(const char* piece) {
-    if (!piece || piece[0] == '\0') return;
-    if (piece[1] == '\0') {
-        unsigned char byte_val = piece[0];
-        if (!(isprint(byte_val) || isspace(byte_val))) return;
+void Tokenizer::Encode(const char *text, bool bos, bool eos, int *tokens,
+                       int *n_tokens) {
+  if (!text) {
+    fprintf(stderr, "Cannot encode NULL text\n");
+    exit(EXIT_FAILURE);
+  }
+  if (!sorted_vocab_) {
+    sorted_vocab_ = new TokenIndex[vocab_size_];
+    for (int i = 0; i < vocab_size_; ++i) {
+      sorted_vocab_[i] = {vocab_[i], i};
     }
-    unsigned char fbit = (unsigned char)piece[0];
-    unsigned char sbit = (unsigned char)piece[1];
-    switch (fbit) {
-        case 0xC3: printf("%c", sbit | 0x40); break;
-        case 0xC2: printf("%c", sbit); break;
-        default: printf("%s", piece); break;
+    std::qsort(sorted_vocab_, vocab_size_, sizeof(TokenIndex),
+               TokenCompareVoid);
+  }
+  char *str_buffer = new char[max_token_length_ * 2 + 3];
+  size_t str_len = 0;
+  *n_tokens = 0;
+  if (bos)
+    tokens[(*n_tokens)++] = 1;
+  if (text[0] != '\0') {
+    int dummy_prefix = StrLookup(const_cast<char *>(" "));
+    if (dummy_prefix != -1)
+      tokens[(*n_tokens)++] = dummy_prefix;
+  }
+  for (const char *c = text; *c != '\0'; ++c) {
+    if ((*c & 0xC0) != 0x80)
+      str_len = 0;
+    str_buffer[str_len++] = *c;
+    str_buffer[str_len] = '\0';
+    if ((*(c + 1) & 0xC0) == 0x80 && str_len < 4)
+      continue;
+    int id = StrLookup(str_buffer);
+    if (id != -1) {
+      tokens[(*n_tokens)++] = id;
+    } else {
+      for (size_t i = 0; i < str_len; ++i) {
+        tokens[(*n_tokens)++] = static_cast<unsigned char>(str_buffer[i]) + 3;
+      }
     }
+    str_len = 0;
+  }
+  while (true) {
+    float best_score = -1e10f;
+    int best_id = -1;
+    int best_idx = -1;
+    for (int i = 0; i < *n_tokens - 1; ++i) {
+      std::sprintf(str_buffer, "%s%s", vocab_[tokens[i]],
+                   vocab_[tokens[i + 1]]);
+      int id = StrLookup(str_buffer);
+      if (id != -1 && vocab_scores_[id] > best_score) {
+        best_score = vocab_scores_[id];
+        best_id = id;
+        best_idx = i;
+      }
+    }
+    if (best_idx == -1)
+      break;
+    tokens[best_idx] = best_id;
+    for (int i = best_idx + 1; i < *n_tokens - 1; ++i) {
+      tokens[i] = tokens[i + 1];
+    }
+    --(*n_tokens);
+  }
+  if (eos)
+    tokens[(*n_tokens)++] = 2;
+  delete[] str_buffer;
 }
 
-int str_lookup(const char* str, const TokenIndex* sorted_vocab, int vocab_size) {
-    TokenIndex tok = {.str = (char*)str};
-    const TokenIndex* res = (const TokenIndex*)bsearch(&tok, sorted_vocab, (size_t)vocab_size, sizeof(TokenIndex), compare_tokens);
-    return res ? res->id : -1;
+char *Tokenizer::Decode(int prev_token, int token) {
+  char *piece = vocab_[token];
+  if (prev_token == 1 && piece[0] == ' ')
+    ++piece;
+  unsigned char byte_val;
+  if (std::sscanf(piece, "<0x%02hhX>", &byte_val) == 1) {
+    piece = reinterpret_cast<char *>(byte_pieces_) + byte_val * 2;
+  }
+  return piece;
 }
 
-void encode(Tokenizer* t, const char* text, int8_t bos, int8_t eos, int* tokens, int* n_tokens) {
-    if (!text) {
-        fprintf(stderr, "cannot encode NULL text\n");
-        exit(EXIT_FAILURE);
-    }
-    if (!t->sorted_vocab) {
-        t->sorted_vocab = (TokenIndex*)malloc((size_t)t->vocab_size * sizeof(TokenIndex));
-        for (int i = 0; i < t->vocab_size; i++) {
-            t->sorted_vocab[i] = {.str = t->vocab[i], .id = i};
-        }
-        qsort(t->sorted_vocab, (size_t)t->vocab_size, sizeof(TokenIndex), compare_tokens);
-    }
-    char* str_buffer = (char*)malloc((size_t)t->max_token_length*2 + 3);
-    size_t str_len = 0;
-    *n_tokens = 0;
-    if (bos) tokens[(*n_tokens)++] = 1;
-    if (text[0] != '\0') {
-        int dummy_prefix = str_lookup(" ", t->sorted_vocab, t->vocab_size);
-        tokens[(*n_tokens)++] = dummy_prefix;
-    }
-    for (const char* c = text; *c != '\0'; c++) {
-        if ((*c & 0xC0) != 0x80) str_len = 0;
-        str_buffer[str_len++] = *c;
-        str_buffer[str_len] = '\0';
-        if ((*(c + 1) & 0xC0) == 0x80 && str_len < 4) continue;
-        int id = str_lookup(str_buffer, t->sorted_vocab, t->vocab_size);
-        if (id != -1) {
-            tokens[(*n_tokens)++] = id;
-        } else {
-            for (size_t i = 0; i < str_len; i++) {
-                tokens[(*n_tokens)++] = (unsigned char)str_buffer[i] + 3;
-            }
-        }
-        str_len = 0;
-    }
-    while (true) {
-        float best_score = -1e10f;
-        int best_id = -1;
-        int best_idx = -1;
-        for (int i = 0; i < *n_tokens - 1; i++) {
-            sprintf(str_buffer, "%s%s", t->vocab[tokens[i]], t->vocab[tokens[i+1]]);
-            int id = str_lookup(str_buffer, t->sorted_vocab, t->vocab_size);
-            if (id != -1 && t->vocab_scores[id] > best_score) {
-                best_score = t->vocab_scores[id];
-                best_id = id;
-                best_idx = i;
-            }
-        }
-        if (best_idx == -1) break;
-        tokens[best_idx] = best_id;
-        for (int i = best_idx + 1; i < *n_tokens - 1; i++) tokens[i] = tokens[i+1];
-        (*n_tokens)--;
-    }
-    if (eos) tokens[(*n_tokens)++] = 2;
-    free(str_buffer);
+void SafePrint(const char *piece) {
+  if (!piece || piece[0] == '\0')
+    return;
+  if (piece[1] == '\0') {
+    unsigned char byte = piece[0];
+    if (!std::isprint(byte) && !std::isspace(byte))
+      return;
+  }
+  unsigned char fbit = static_cast<unsigned char>(piece[0]);
+  if (fbit == 0xC3) {
+    printf("%c", static_cast<unsigned char>(piece[1]) | 0x40);
+  } else if (fbit == 0xC2) {
+    printf("%c", static_cast<unsigned char>(piece[1]));
+  } else {
+    printf("%s", piece);
+  }
 }
 
-// Sampler
-int argmax(const float* probabilities, int n) {
-    int max_i = 0;
-    float max_p = probabilities[0];
-    for (int i = 1; i < n; i++) {
-        if (probabilities[i] > max_p) {
-            max_i = i;
-            max_p = probabilities[i];
-        }
+int ArgMax(const float *probs, int n) {
+  int max_i = 0;
+  float max_p = probs[0];
+  for (int i = 1; i < n; ++i) {
+    if (probs[i] > max_p) {
+      max_i = i;
+      max_p = probs[i];
     }
-    return max_i;
+  }
+  return max_i;
 }
 
-// Time util
-long time_in_ms() {
-    struct timespec time;
-    clock_gettime(CLOCK_REALTIME, &time);
-    return time.tv_sec * 1000 + time.tv_nsec / 1000000;
+long TimeInMs() {
+  timespec ts;
+  clock_gettime(CLOCK_REALTIME, &ts);
+  return ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-// Generate
-void generate(Transformer* transformer, Tokenizer* tokenizer, const char* prompt, int max_new_tokens) {
-    if (!prompt) prompt = "";
-    int num_prompt_tokens = 0;
-    int* prompt_tokens = (int*)malloc((strlen(prompt) + 3) * sizeof(int));
-    encode(tokenizer, (char*)prompt, 1, 0, prompt_tokens, &num_prompt_tokens);
-    if (prompt_tokens[1] == 306) prompt_tokens[1] = 76; // Monkey patch
-    if (num_prompt_tokens < 1) {
-        fprintf(stderr, "expected at least 1 prompt token\n");
-        exit(EXIT_FAILURE);
+void Generate(LlamaModelGPU &model, Tokenizer &tokenizer, const char *prompt,
+              int max_new_tokens) {
+  if (!prompt)
+    prompt = "";
+  int num_prompt_tokens = 0;
+  int *prompt_tokens = new int[std::strlen(prompt) + 3];
+  tokenizer.Encode(prompt, true, false, prompt_tokens, &num_prompt_tokens);
+  // TODO: pretty dirty monkey patch for 'I have a dream' prompt.
+  if (prompt_tokens[1] == 306)
+    prompt_tokens[1] = 76;
+  if (num_prompt_tokens < 1) {
+    fprintf(stderr, "Expected at least 1 prompt token\n");
+    exit(EXIT_FAILURE);
+  }
+  long start = 0;
+  int next = 0;
+  int token = prompt_tokens[0];
+  int pos = 0;
+  float *logits = new float[model.Config().vocab_size];
+  while (pos < max_new_tokens - 1) {
+    model.Forward(token, pos, logits);
+    if (pos < num_prompt_tokens - 1) {
+      next = prompt_tokens[pos + 1];
+    } else {
+      if (start == 0)
+        start = TimeInMs();
+      next = ArgMax(logits, model.Config().vocab_size);
     }
-    long start = 0;
-    int next;
-    int token = prompt_tokens[0];
-    int pos = 0;
-    while (pos < max_new_tokens - 1) {
-        float* logits = forward(transformer, token, pos);
-        if (pos < num_prompt_tokens - 1) {
-            next = prompt_tokens[pos + 1];
-        } else {
-            next = argmax(logits, transformer->config.vocab_size);
-        }
-        pos++;
-        if (next == 1) break;
-        char* piece = decode(tokenizer, token, next);
-        safe_printf(piece);
-        fflush(stdout);
-        token = next;
-        if (start == 0) start = time_in_ms();
-    }
-    printf("\n");
-    if (pos > 1) {
-        long end = time_in_ms();
-        double elapsed = (double)(end - start) / 1000.0;
-        fprintf(stderr, "Token count: %d, elapsed: %.2fs, %.0f tokens/s\n",
-                pos + 1, elapsed, (double)(pos - 1) / elapsed);
-    }
-    free(prompt_tokens);
+    ++pos;
+    if (next == 1)
+      break;
+    char *piece = tokenizer.Decode(token, next);
+    SafePrint(piece);
+    std::fflush(stdout);
+    token = next;
+  }
+  printf("\n");
+  if (pos > 1) {
+    long end = TimeInMs();
+    double elapsed = static_cast<double>(end - start) / 1000.0;
+    fprintf(stderr, "Tokens: %d, time: %.2fs, speed: %.0f tok/s\n",
+            pos - num_prompt_tokens + 1, elapsed,
+            static_cast<double>(pos - num_prompt_tokens) / elapsed);
+  }
+  delete[] prompt_tokens;
+  delete[] logits;
 }
 
-int main(int argc, char** argv) {
-    const char* checkpoint_path = "stories15M.bin";
-    const char* tokenizer_path = "tokenizer.bin";
-    int max_new_tokens = 50;
-    const char* prompt = "I have a dream";
-    if (argc >= 2) prompt = argv[1];
-    Transformer transformer;
-    build_transformer(&transformer, checkpoint_path);
-    if (max_new_tokens > transformer.config.max_seq_len) max_new_tokens = transformer.config.max_seq_len;
-    Tokenizer tokenizer;
-    build_tokenizer(&tokenizer, tokenizer_path, transformer.config.vocab_size);
-    create_cublas_handle();
-    generate(&transformer, &tokenizer, prompt, max_new_tokens);
-    free_tokenizer(&tokenizer);
-    free_transformer(&transformer);
-    destroy_cublas_handle();
-    return 0;
+} // namespace llama
+
+int main(int argc, char **argv) {
+  const char *checkpoint = (argc > 1) ? argv[1] : "stories15M.bin";
+  const char *tokenizer_path = (argc > 2) ? argv[2] : "tokenizer.bin";
+  int max_new_tokens = (argc > 3) ? std::atoi(argv[3]) : 50;
+  const char *prompt = (argc > 4) ? argv[4] : "I have a dream";
+
+  llama::LlamaModelGPU model(checkpoint);
+  if (max_new_tokens > model.Config().max_seq_len)
+    max_new_tokens = model.Config().max_seq_len;
+  llama::Tokenizer tokenizer(tokenizer_path, model.Config().vocab_size);
+
+  llama::Generate(model, tokenizer, prompt, max_new_tokens);
+
+  return 0;
 }
