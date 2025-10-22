@@ -50,8 +50,8 @@ struct LlamaConfig {
   int max_seq_len; // max_position_embeddings
 };
 
-// LlamaLayerWeightsGPU holds device pointers for layer weights.
-struct LlamaLayerWeightsGPU {
+// LlamaLayerWeights holds device pointers for layer weights.
+struct LlamaLayerWeights {
   float *attn_norm; // input_layernorm.weight
   float *q_proj;    // self_attn.q_proj.weight
   float *k_proj;    // self_attn.k_proj.weight
@@ -63,16 +63,16 @@ struct LlamaLayerWeightsGPU {
   float *down_proj; // mlp.down_proj.weight
 };
 
-// LlamaWeightsGPU holds all device weights.
-struct LlamaWeightsGPU {
+// LlamaWeights holds all device weights.
+struct LlamaWeights {
   float *embed_tokens;                      // model.embed_tokens.weight
   float *norm;                              // model.norm.weight
   float *output;                            // lm_head.weight
-  std::vector<LlamaLayerWeightsGPU> layers; // model.layers
+  std::vector<LlamaLayerWeights> layers; // model.layers
 };
 
-// LlamaStateGPU holds device buffers for inference.
-struct LlamaStateGPU {
+// LlamaState holds device buffers for inference.
+struct LlamaState {
   float *x;           // hidden_states
   float *xb;          // temp for attention
   float *xb2;         // temp for attention output
@@ -99,11 +99,11 @@ private:
   cublasHandle_t handle_;
 };
 
-// LlamaModelGPU manages the model on GPU.
-class LlamaModelGPU {
+// LlamaModel manages the model on GPU.
+class LlamaModel {
 public:
-  LlamaModelGPU(const char *checkpoint_path);
-  ~LlamaModelGPU();
+  LlamaModel(const char *checkpoint_path);
+  ~LlamaModel();
 
   void Forward(int token, int pos, float *logits_cpu);
   const LlamaConfig &Config() const { return config_; }
@@ -116,8 +116,8 @@ private:
   void LayerForward(int layer, int pos);
 
   LlamaConfig config_;
-  LlamaWeightsGPU weights_;
-  LlamaStateGPU state_;
+  LlamaWeights weights_;
+  LlamaState state_;
   CuBlasHandle cublas_;
   int fd_ = -1;
   void *mapped_data_ = MAP_FAILED;
@@ -125,12 +125,12 @@ private:
   float *device_weights_ = nullptr;
 };
 
-LlamaModelGPU::LlamaModelGPU(const char *checkpoint_path) : cublas_() {
+LlamaModel::LlamaModel(const char *checkpoint_path) : cublas_() {
   LoadWeights(checkpoint_path);
   AllocState();
 }
 
-LlamaModelGPU::~LlamaModelGPU() {
+LlamaModel::~LlamaModel() {
   FreeState();
   if (device_weights_)
     CUDA_CHECK(cudaFree(device_weights_));
@@ -140,7 +140,7 @@ LlamaModelGPU::~LlamaModelGPU() {
     close(fd_);
 }
 
-void LlamaModelGPU::LoadWeights(const char *checkpoint_path) {
+void LlamaModel::LoadWeights(const char *checkpoint_path) {
   FILE *file = fopen(checkpoint_path, "rb");
   if (!file) {
     fprintf(stderr, "Failed to open %s\n", checkpoint_path);
@@ -241,7 +241,7 @@ void LlamaModelGPU::LoadWeights(const char *checkpoint_path) {
   weights_.output = shared_weights ? weights_.embed_tokens : ptr;
 }
 
-void LlamaModelGPU::AllocState() {
+void LlamaModel::AllocState() {
   int kv_dim = (config_.dim * config_.n_kv_heads) / config_.n_heads;
   CUDA_CHECK(cudaMalloc(&state_.x, config_.dim * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&state_.xb, config_.dim * sizeof(float)));
@@ -262,7 +262,7 @@ void LlamaModelGPU::AllocState() {
   state_.logits_cpu = new float[config_.vocab_size]();
 }
 
-void LlamaModelGPU::FreeState() {
+void LlamaModel::FreeState() {
   CUDA_CHECK(cudaFree(state_.x));
   CUDA_CHECK(cudaFree(state_.xb));
   CUDA_CHECK(cudaFree(state_.xb2));
@@ -436,7 +436,7 @@ void Accum(float *a, const float *b, int size) {
   CUDA_CHECK(cudaGetLastError());
 }
 
-void LlamaModelGPU::LayerForward(int layer, int pos) {
+void LlamaModel::LayerForward(int layer, int pos) {
   auto &lw = weights_.layers[layer];
   int dim = config_.dim;
   int kv_dim = (config_.dim * config_.n_kv_heads) / config_.n_heads;
@@ -477,7 +477,7 @@ void LlamaModelGPU::LayerForward(int layer, int pos) {
   Accum(state_.x, state_.xb, dim);
 }
 
-void LlamaModelGPU::Forward(int token, int pos, float *logits_cpu) {
+void LlamaModel::Forward(int token, int pos, float *logits_cpu) {
   int dim = config_.dim;
   float *embed_row = weights_.embed_tokens + token * dim;
   CUDA_CHECK(cudaMemcpy(state_.x, embed_row, dim * sizeof(float),
@@ -699,7 +699,7 @@ long TimeInMs() {
   return ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-void Generate(LlamaModelGPU &model, Tokenizer &tokenizer, const char *prompt,
+void Generate(LlamaModel &model, Tokenizer &tokenizer, const char *prompt,
               int max_new_tokens) {
   if (!prompt)
     prompt = "";
@@ -752,10 +752,10 @@ void Generate(LlamaModelGPU &model, Tokenizer &tokenizer, const char *prompt,
 int main(int argc, char **argv) {
   const char *checkpoint = (argc > 1) ? argv[1] : "stories15M.bin";
   const char *tokenizer_path = (argc > 2) ? argv[2] : "tokenizer.bin";
-  int max_new_tokens = (argc > 3) ? std::atoi(argv[3]) : 50;
+  int max_new_tokens = (argc > 3) ? std::atoi(argv[3]) : 200;
   const char *prompt = (argc > 4) ? argv[4] : "I have a dream";
 
-  llama::LlamaModelGPU model(checkpoint);
+  llama::LlamaModel model(checkpoint);
   if (max_new_tokens > model.Config().max_seq_len)
     max_new_tokens = model.Config().max_seq_len;
   llama::Tokenizer tokenizer(tokenizer_path, model.Config().vocab_size);
